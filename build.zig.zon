@@ -1,0 +1,37 @@
+.{
+    .name = .htv_zig,
+    .version = "0.0.1",
+    .dependencies = .{
+        .wio = .{
+            .url = "git+https://github.com/ypsvlq/wio#62c403cc3145fc1ccbb589a6455cdc8a6db441f5",
+            .hash = "wio-0.0.0-8xHrr3kTBwCdbLwAC5lUbGzzS_ItunX368RG6Lk8zP3x",
+        },
+        .vulkan = .{
+            .url = "git+https://github.com/Snektron/vulkan-zig#5234ae68d1ac143b3ebd1a6e2e40aaa0ef7693c7",
+            .hash = "vulkan-0.0.0-r7Ytx7t9AwBjKG7tnhReEVo0P2fvstTc8G_0qF8iog_V",
+        },
+        .vulkan_headers = .{
+            .url = "https://github.com/KhronosGroup/Vulkan-Headers/archive/v1.4.349.tar.gz",
+            .hash = "N-V-__8AAC1ZbAIG2kVq3iPpAWaOlDTQ3MOyOyQQR0o_-9ez",
+        },
+        .obj = .{
+            .url = "git+https://github.com/chip2n/zig-obj#6070356009e761a4aef82256f1f431037ae97426",
+            .hash = "obj-3.0.2-v8OfivnLAAAgz1LaweX7sbe5ffod4VglAnYFCyjcPr1m",
+        },
+        .zalgebra = .{
+            .url = "git+https://github.com/kooparse/zalgebra#a054c778092396b2e714753c56e6114a0826b409",
+            .hash = "zalgebra-0.0.0-aaiVSkF4AQALCVQT0zGV7reBLMtG1tpXlqrDXfnQ0hn_",
+        },
+        .mr_texture = .{
+            .url = "git+https://codeberg.org/Games-by-Mason/mr_texture.git#de43f22935aed1cc5688bb57565cbd0656e65bf7",
+            .hash = "mr_texture-0.1.0-OtdRTq8CAwD3jIbz7UiBVO0GX7PVEJJn8C6hhj25OhiM",
+        },
+        .mr_ktx2 = .{
+            .url = "git+https://codeberg.org/Games-by-Mason/mr_ktx2.git#6c997d084c4b993c75e996685587424e7d3ea918",
+            .hash = "mr_ktx2-0.0.0-8RkzwgO2AACuMhWTeClrFEeLR_WbsKjDOZyU95jknRWh",
+        },
+    },
+    .minimum_zig_version = "0.16.0",
+    .paths = .{""},
+    .fingerprint = 0x6ef55123de863c47,
+}
