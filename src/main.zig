@@ -124,6 +124,8 @@ var app = struct {
     shader_data: ShaderData = .{},
     cam_pos: za.Vec3 = .new(0, 0, -6),
     object_rotations: [3]za.Vec3 = [_]za.Vec3{.zero()} ** 3,
+
+    rot_speed: f32 = 5.0,
 }{};
 
 pub fn main(init: std.process.Init) !void {
@@ -205,6 +207,11 @@ fn loop() !bool {
     var aspect: f32 = @floatFromInt(app.size.width);
     aspect /= @floatFromInt(app.size.height);
     app.shader_data.projection = za.perspective(45, aspect, 0.1, 32);
+
+    // Convert from OpenGL depth [-1, 1] to Vulkan [0, 1]
+    app.shader_data.projection.data[2][2] = app.shader_data.projection.data[2][2] * 0.5 + app.shader_data.projection.data[2][3] * 0.5;
+    app.shader_data.projection.data[3][2] = app.shader_data.projection.data[3][2] * 0.5 + app.shader_data.projection.data[3][3] * 0.5;
+
     app.shader_data.view = za.Mat4.identity().translate(app.cam_pos);
     for (0..3) |i| {
         var x: f32 = @floatFromInt(i);
@@ -442,14 +449,157 @@ fn loop() !bool {
         },
     ));
 
-    // TMP
     while (app.window.getEvent()) |event| {
         switch (event) {
             .close => return false,
+            .size_physical => |new_size| {
+                app.size = new_size;
+                app.update_swapchain = true;
+            },
+            .button_press => |button| {
+                switch (button) {
+                    .left, .a => {
+                        app.object_rotations[app.shader_data.selected].yMut().* -= app.rot_speed;
+                    },
+                    .right, .d => {
+                        app.object_rotations[app.shader_data.selected].yMut().* += app.rot_speed;
+                    },
+                    .up, .w => {
+                        app.object_rotations[app.shader_data.selected].xMut().* -= app.rot_speed;
+                    },
+                    .down, .s => {
+                        app.object_rotations[app.shader_data.selected].xMut().* += app.rot_speed;
+                    },
+                    .space => {
+                        app.shader_data.selected = (app.shader_data.selected + 1) % 3;
+                    },
+                    else => {},
+                }
+            },
             else => {},
         }
     }
-    // TMP
+
+    // resize swapchain
+    if (app.update_swapchain) {
+        app.update_swapchain = false;
+        try app.device.deviceWaitIdle();
+        app.surface_capabilities = try app.instance.getPhysicalDeviceSurfaceCapabilitiesKHR(
+            app.physical_device,
+            app.surface,
+        );
+        const old_swapchain = app.swapchain;
+        app.swapchain = try app.device.createSwapchainKHR(&vk.SwapchainCreateInfoKHR{
+            .surface = app.surface,
+            .old_swapchain = old_swapchain,
+            .min_image_count = app.surface_capabilities.min_image_count,
+            .image_format = app.image_format,
+            .image_color_space = .srgb_nonlinear_khr,
+            .image_extent = .{ .width = app.size.width, .height = app.size.height },
+            .image_array_layers = 1,
+            .image_usage = .{ .color_attachment_bit = true },
+            .image_sharing_mode = .exclusive,
+            .queue_family_index_count = 0,
+            .p_queue_family_indices = &.{app.queue_family_index},
+            .pre_transform = .{ .identity_bit_khr = true },
+            .composite_alpha = .{ .opaque_bit_khr = true },
+            .present_mode = .fifo_khr,
+            .clipped = .true,
+        }, null);
+
+        for (app.swapchain_image_views) |image_view| {
+            app.device.destroyImageView(image_view, null);
+        }
+
+        var image_count: u32 = undefined;
+        try chk(try app.device.getSwapchainImagesKHR(
+            app.swapchain,
+            &image_count,
+            null,
+        ));
+        assert(image_count == app.swapchain_images.len);
+        try chk(try app.device.getSwapchainImagesKHR(
+            app.swapchain,
+            &image_count,
+            app.swapchain_images.ptr,
+        ));
+
+        for (0..image_count) |i| {
+            app.swapchain_image_views[i] = try app.device.createImageView(
+                &std.mem.zeroInit(vk.ImageViewCreateInfo, .{
+                    .image = app.swapchain_images[i],
+                    .view_type = .@"2d",
+                    .format = app.image_format,
+                    .subresource_range = .{
+                        .aspect_mask = .{ .color_bit = true },
+                        .level_count = 1,
+                        .layer_count = 1,
+                        .base_array_layer = 0,
+                        .base_mip_level = 0,
+                    },
+                }),
+                null,
+            );
+        }
+
+        assert(image_count == app.render_semaphores.len);
+        for (app.render_semaphores) |*semaphore| {
+            app.device.destroySemaphore(semaphore.*, null);
+            semaphore.* = try app.device.createSemaphore(&vk.SemaphoreCreateInfo{}, null);
+        }
+
+        app.device.destroySwapchainKHR(old_swapchain, null);
+        c.vmaDestroyImage(
+            app.vma_allocator,
+            @ptrFromInt(@intFromEnum(app.depth_image)),
+            app.depth_image_allocation,
+        );
+        app.device.destroyImageView(app.depth_image_view, null);
+
+        try chk_c(c.vmaCreateImage(
+            app.vma_allocator,
+            @ptrCast(&vk.ImageCreateInfo{
+                .image_type = .@"2d",
+                .format = app.depth_format,
+                .extent = .{
+                    .width = app.size.width,
+                    .height = app.size.height,
+                    .depth = 1,
+                },
+                .mip_levels = 1,
+                .array_layers = 1,
+                .samples = .{ .@"1_bit" = true },
+                .tiling = .optimal,
+                .usage = .{ .depth_stencil_attachment_bit = true },
+                .initial_layout = .undefined,
+                .sharing_mode = .exclusive,
+            }),
+            &c.VmaAllocationCreateInfo{
+                .flags = c.VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+                .usage = c.VMA_MEMORY_USAGE_AUTO,
+            },
+            @ptrCast(&app.depth_image),
+            &app.depth_image_allocation,
+            null,
+        ));
+
+        app.depth_image_view = try app.device.createImageView(
+            &std.mem.zeroInit(vk.ImageViewCreateInfo, .{
+                .image = app.depth_image,
+                .view_type = .@"2d",
+                .format = app.depth_format,
+                .subresource_range = .{
+                    .aspect_mask = .{ .depth_bit = true },
+                    .level_count = 1,
+                    .layer_count = 1,
+                    .base_array_layer = 0,
+                    .base_mip_level = 0,
+                },
+            }),
+            null,
+        );
+    }
+
     return true;
 }
 
@@ -844,37 +994,53 @@ fn loadMesh() !void {
     log.info("\t{d} indices", .{app.model_obj.meshes[0].indices.len});
     log.info("\t{d} materials", .{app.model_obj.meshes[0].materials.len});
     log.info("\t{d} faces", .{app.model_obj.meshes[0].num_vertices.len});
-    log.info("\t{d} vertices per face", .{app.model_obj.meshes[0].num_vertices[0]});
-    const num_indices = app.model_obj.meshes[0].indices.len;
 
-    app.vertices = try app.init.gpa.alloc(Vertex, num_indices);
-    app.indices = try app.init.gpa.alloc(u16, num_indices);
+    var total_vertices: usize = 0;
+    for (app.model_obj.meshes[0].num_vertices) |count| {
+        total_vertices += (count - 2) * 3;
+    }
 
-    for (0.., app.model_obj.meshes[0].indices) |i, index| {
-        const v: Vertex = .{
-            .pos = za.Vec3.new(
-                app.model_obj.vertices[index.vertex.? * 3],
-                -app.model_obj.vertices[index.vertex.? * 3 + 1],
-                app.model_obj.vertices[index.vertex.? * 3 + 2],
-            ),
-            .normal = za.Vec3.new(
-                app.model_obj.normals[index.normal.? * 3],
-                -app.model_obj.normals[index.normal.? * 3 + 1],
-                app.model_obj.normals[index.normal.? * 3 + 2],
-            ),
-            .uv = za.Vec2.new(
-                app.model_obj.tex_coords[index.tex_coord.? * 2],
-                1.0 - app.model_obj.tex_coords[index.tex_coord.? * 2 + 1],
-            ),
-        };
-        app.vertices[i] = v;
-        app.indices[i] = @intCast(i);
+    app.vertices = try app.init.gpa.alloc(Vertex, total_vertices);
+    app.indices = try app.init.gpa.alloc(u16, total_vertices);
+
+    var v_i: usize = 0;
+    var offset: usize = 0;
+    for (app.model_obj.meshes[0].num_vertices) |face_v_count| {
+        const face_indices = app.model_obj.meshes[0].indices[offset .. offset + face_v_count];
+
+        // Triangulate face (Triangle Fan)
+        for (1..face_v_count - 1) |i| {
+            const local_idxs = [_]usize{ 0, i, i + 1 };
+            for (local_idxs) |local_idx| {
+                const index = face_indices[local_idx];
+                const v: Vertex = .{
+                    .pos = za.Vec3.new(
+                        app.model_obj.vertices[index.vertex.? * 3],
+                        -app.model_obj.vertices[index.vertex.? * 3 + 1],
+                        app.model_obj.vertices[index.vertex.? * 3 + 2],
+                    ),
+                    .normal = za.Vec3.new(
+                        app.model_obj.normals[index.normal.? * 3],
+                        -app.model_obj.normals[index.normal.? * 3 + 1],
+                        app.model_obj.normals[index.normal.? * 3 + 2],
+                    ),
+                    .uv = za.Vec2.new(
+                        app.model_obj.tex_coords[index.tex_coord.? * 2],
+                        1.0 - app.model_obj.tex_coords[index.tex_coord.? * 2 + 1],
+                    ),
+                };
+                app.vertices[v_i] = v;
+                app.indices[v_i] = @intCast(v_i);
+                v_i += 1;
+            }
+        }
+        offset += face_v_count;
     }
 
     log.debug("translated model", .{});
 
-    const vertex_buf_size: vk.DeviceSize = @sizeOf(Vertex) * num_indices;
-    const index_buf_size: vk.DeviceSize = @sizeOf(u16) * num_indices;
+    const vertex_buf_size: vk.DeviceSize = @sizeOf(Vertex) * total_vertices;
+    const index_buf_size: vk.DeviceSize = @sizeOf(u16) * total_vertices;
     var vertex_buf_alloc_info: c.VmaAllocationInfo = .{};
     try chk_c(c.vmaCreateBuffer(
         app.vma_allocator,
@@ -895,11 +1061,11 @@ fn loadMesh() !void {
     ));
 
     const vertex_buf_ptr: [*]Vertex = @ptrCast(@alignCast(vertex_buf_alloc_info.pMappedData.?));
-    @memcpy(vertex_buf_ptr, app.vertices);
+    @memcpy(vertex_buf_ptr[0..app.vertices.len], app.vertices);
     log.debug("uploaded vertices", .{});
 
     const index_buf_ptr: [*]u16 = @ptrCast(&vertex_buf_ptr[app.vertices.len]);
-    @memcpy(index_buf_ptr, app.indices);
+    @memcpy(index_buf_ptr[0..app.indices.len], app.indices);
     log.debug("uploaded indices", .{});
 }
 
@@ -1449,7 +1615,7 @@ fn chk_c(result: c.VkResult) !void {
 }
 
 fn chk_swapchain(result: vk.Result) !void {
-    if (result == .error_out_of_date_khr) {
+    if (result == .error_out_of_date_khr or result == .suboptimal_khr) {
         app.update_swapchain = true;
         return;
     }
