@@ -34,7 +34,7 @@ const ShaderData = extern struct {
     projection: za.Mat4 = za.Mat4.zero(),
     view: za.Mat4 = za.Mat4.zero(),
     model: [3]za.Mat4 = [_]za.Mat4{.zero()} ** 3,
-    light_pos: za.Vec4 = za.Vec4.new(0, 10, 10, 0),
+    light_pos: za.Vec4 = za.Vec4.new(0, -10, 10, 0),
     selected: u32 = 1,
 };
 
@@ -212,7 +212,7 @@ fn loop() !bool {
         const instance_pos = za.Vec3.new(x, 0, 0);
         app.shader_data.model[i] = za.Mat4.identity()
             .translate(instance_pos)
-            .mul(za.Quat.fromVec3(1, app.object_rotations[i]).toMat4());
+            .mul(za.Quat.fromEulerAngles(app.object_rotations[i]).toMat4());
     }
     const shader_data_buffer: [*]ShaderData = @ptrCast(@alignCast(
         app.shader_data_buffers[app.frame_index].allocation_info.pMappedData.?,
@@ -844,6 +844,7 @@ fn loadMesh() !void {
     log.info("\t{d} indices", .{app.model_obj.meshes[0].indices.len});
     log.info("\t{d} materials", .{app.model_obj.meshes[0].materials.len});
     log.info("\t{d} faces", .{app.model_obj.meshes[0].num_vertices.len});
+    log.info("\t{d} vertices per face", .{app.model_obj.meshes[0].num_vertices[0]});
     const num_indices = app.model_obj.meshes[0].indices.len;
 
     app.vertices = try app.init.gpa.alloc(Vertex, num_indices);
