@@ -24,6 +24,11 @@ pub fn build(b: *std.Build) void {
         .flags = &[_][]const u8{"-std=c++20"},
         .language = .cpp,
     });
+    exe_mod.addCSourceFile(.{
+        .file = b.path("src/slang_wrapper.cpp"),
+        .flags = &[_][]const u8{"-std=c++20"},
+        .language = .cpp,
+    });
 
     const obj_mod = b.dependency("obj", .{ .target = target, .optimize = optimize }).module("obj");
     exe_mod.addImport("obj", obj_mod);
@@ -78,9 +83,12 @@ pub fn build(b: *std.Build) void {
     });
 
     b.installArtifact(ktx_lib);
-
     exe_mod.linkLibrary(ktx_lib);
     exe_mod.addIncludePath(b.path("external/ktx/include"));
+
+    const vulkan_lib_path = b.pathJoin(&[_][]const u8{ vulkan_sdk_path, "Lib" });
+    exe_mod.addLibraryPath(.{ .cwd_relative = vulkan_lib_path });
+    exe_mod.linkSystemLibrary("slang", .{ .preferred_link_mode = .static });
 
     const exe = b.addExecutable(.{
         .name = "vulkan",

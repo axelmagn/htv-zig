@@ -10,6 +10,7 @@ const c = @cImport({
     @cInclude("vma/vk_mem_alloc.h");
     @cInclude("ktx.h");
     @cInclude("ktxvulkan.h");
+    @cInclude("slang_wrapper.h");
 });
 
 const log = std.log.scoped(.htv);
@@ -30,9 +31,9 @@ const Vertex = extern struct {
 };
 
 const ShaderData = extern struct {
-    projection: za.Mat4,
-    view: za.Mat4,
-    model: [3]za.Mat4,
+    projection: za.Mat4 = za.Mat4.zero(),
+    view: za.Mat4 = za.Mat4.zero(),
+    model: [3]za.Mat4 = [_]za.Mat4{.zero()} ** 3,
     light_pos: za.Vec4 = za.Vec4.new(0, 10, 10, 0),
     selected: u32 = 1,
 };
@@ -79,6 +80,9 @@ var app = struct {
     swapchain_images: []vk.Image = undefined,
     swapchain_image_views: []vk.ImageView = undefined,
 
+    image_format: vk.Format = .undefined,
+    depth_format: vk.Format = .undefined,
+
     depth_image: vk.Image = .null_handle,
     depth_image_view: vk.ImageView = .null_handle,
     depth_image_allocation: c.VmaAllocation = undefined,
@@ -105,6 +109,21 @@ var app = struct {
     descriptor_pool: vk.DescriptorPool = .null_handle,
     descriptor_set_layout_tex: vk.DescriptorSetLayout = .null_handle,
     descriptor_set_tex: vk.DescriptorSet = .null_handle,
+
+    slang_wrapper: *c.SlangWrapper = undefined,
+
+    pipeline: vk.Pipeline = .null_handle,
+    pipeline_layout: vk.PipelineLayout = .null_handle,
+
+    visible: bool = true,
+
+    frame_index: u32 = 0,
+    image_index: u32 = 0,
+    update_swapchain: bool = false,
+
+    shader_data: ShaderData = .{},
+    cam_pos: za.Vec3 = .new(0, 0, -6),
+    object_rotations: [3]za.Vec3 = [_]za.Vec3{.zero()} ** 3,
 }{};
 
 pub fn main(init: std.process.Init) !void {
@@ -157,6 +176,281 @@ pub fn main(init: std.process.Init) !void {
     defer app.init.gpa.free(app.render_semaphores);
     try createCommandPool();
     try loadTextures();
+    try loadShaders();
+    defer c.slang_wrapper_destroy(app.slang_wrapper);
+
+    log.info("beginning loop", .{});
+
+    try wio.run(loop);
+}
+
+fn loop() !bool {
+    // sync
+    try chk(try app.device.waitForFences(
+        (&app.fences[app.frame_index])[0..1],
+        .true,
+        std.math.maxInt(u64),
+    ));
+    try app.device.resetFences((&app.fences[app.frame_index])[0..1]);
+    const next_image_res = try app.device.acquireNextImageKHR(
+        app.swapchain,
+        std.math.maxInt(u64),
+        app.present_semaphores[app.frame_index],
+        .null_handle,
+    );
+    try chk_swapchain(next_image_res.result);
+    app.image_index = next_image_res.image_index;
+
+    // update shader data
+    var aspect: f32 = @floatFromInt(app.size.width);
+    aspect /= @floatFromInt(app.size.height);
+    app.shader_data.projection = za.perspective(45, aspect, 0.1, 32);
+    app.shader_data.view = za.Mat4.identity().translate(app.cam_pos);
+    for (0..3) |i| {
+        var x: f32 = @floatFromInt(i);
+        x = (x - 1) * 3;
+        const instance_pos = za.Vec3.new(x, 0, 0);
+        app.shader_data.model[i] = za.Mat4.identity()
+            .translate(instance_pos)
+            .mul(za.Quat.fromVec3(1, app.object_rotations[i]).toMat4());
+    }
+    const shader_data_buffer: [*]ShaderData = @ptrCast(@alignCast(
+        app.shader_data_buffers[app.frame_index].allocation_info.pMappedData.?,
+    ));
+    @memcpy(
+        shader_data_buffer,
+        (&app.shader_data)[0..1],
+    );
+
+    // build command buffer
+    const cmd_buf = app.command_buffers[app.frame_index];
+    try app.device.resetCommandBuffer(cmd_buf, .{});
+    try app.device.beginCommandBuffer(cmd_buf, &vk.CommandBufferBeginInfo{
+        .flags = .{ .one_time_submit_bit = true },
+    });
+
+    app.device.cmdPipelineBarrier2(cmd_buf, &vk.DependencyInfo{
+        .image_memory_barrier_count = 2,
+        .p_image_memory_barriers = &[2]vk.ImageMemoryBarrier2{
+            vk.ImageMemoryBarrier2{
+                .src_stage_mask = .{ .color_attachment_output_bit = true },
+                .src_access_mask = .{},
+                .dst_stage_mask = .{ .color_attachment_output_bit = true },
+                .dst_access_mask = .{
+                    .color_attachment_read_bit = true,
+                    .color_attachment_write_bit = true,
+                },
+                .old_layout = .undefined,
+                .new_layout = .attachment_optimal,
+                .image = app.swapchain_images[app.image_index],
+                .subresource_range = .{
+                    .aspect_mask = .{ .color_bit = true },
+                    .level_count = 1,
+                    .layer_count = 1,
+                    .base_array_layer = 0,
+                    .base_mip_level = 0,
+                },
+                .src_queue_family_index = 0,
+                .dst_queue_family_index = 0,
+            },
+            vk.ImageMemoryBarrier2{
+                .src_stage_mask = .{ .late_fragment_tests_bit = true },
+                .src_access_mask = .{ .depth_stencil_attachment_write_bit = true },
+                .dst_stage_mask = .{ .early_fragment_tests_bit = true },
+                .dst_access_mask = .{ .depth_stencil_attachment_write_bit = true },
+                .old_layout = .undefined,
+                .new_layout = .attachment_optimal,
+                .image = app.depth_image,
+                .subresource_range = .{
+                    .aspect_mask = .{ .depth_bit = true, .stencil_bit = true },
+                    .level_count = 1,
+                    .layer_count = 1,
+                    .base_array_layer = 0,
+                    .base_mip_level = 0,
+                },
+                .src_queue_family_index = 0,
+                .dst_queue_family_index = 0,
+            },
+        },
+    });
+
+    app.device.cmdBeginRendering(
+        cmd_buf,
+        &std.mem.zeroInit(
+            vk.RenderingInfo,
+            .{
+                .render_area = .{
+                    .extent = .{
+                        .width = @as(u32, app.size.width),
+                        .height = @as(u32, app.size.height),
+                    },
+                    .offset = .{ .x = 0, .y = 0 },
+                },
+                .layer_count = 1,
+                .color_attachment_count = 1,
+                .p_color_attachments = @as(
+                    [*]const vk.RenderingAttachmentInfo,
+                    @ptrCast(&std.mem.zeroInit(
+                        vk.RenderingAttachmentInfo,
+                        .{
+                            .image_view = app.swapchain_image_views[app.image_index],
+                            .image_layout = .attachment_optimal,
+                            .load_op = .clear,
+                            .store_op = .store,
+                            .clear_value = vk.ClearValue{
+                                .color = .{
+                                    .float_32 = .{ 0, 0, 0, 1 },
+                                },
+                            },
+                        },
+                    )),
+                ),
+                .p_depth_attachment = &std.mem.zeroInit(
+                    vk.RenderingAttachmentInfo,
+                    .{
+                        .image_view = app.depth_image_view,
+                        .image_layout = .attachment_optimal,
+                        .load_op = .clear,
+                        .store_op = .dont_care,
+                        .clear_value = vk.ClearValue{
+                            .depth_stencil = .{
+                                .depth = 1,
+                                .stencil = 0,
+                            },
+                        },
+                    },
+                ),
+            },
+        ),
+    );
+
+    app.device.cmdSetViewport(
+        cmd_buf,
+        0,
+        (&vk.Viewport{
+            .width = @floatFromInt(app.size.width),
+            .height = @floatFromInt(app.size.height),
+            .min_depth = 0,
+            .max_depth = 1,
+            .x = 0,
+            .y = 0,
+        })[0..1],
+    );
+
+    app.device.cmdBindPipeline(cmd_buf, .graphics, app.pipeline);
+
+    app.device.cmdSetScissor(
+        cmd_buf,
+        0,
+        (&vk.Rect2D{
+            .extent = .{
+                .width = @intCast(app.size.width),
+                .height = @intCast(app.size.height),
+            },
+            .offset = .{ .x = 0, .y = 0 },
+        })[0..1],
+    );
+
+    app.device.cmdBindDescriptorSets(
+        cmd_buf,
+        .graphics,
+        app.pipeline_layout,
+        0,
+        (&app.descriptor_set_tex)[0..1],
+        null,
+    );
+
+    app.device.cmdBindVertexBuffers(
+        cmd_buf,
+        0,
+        (&app.vertex_buffer)[0..1],
+        (&@as(u64, 0))[0..1],
+    );
+
+    const vertex_buffer_size = @sizeOf(Vertex) * app.vertices.len;
+    app.device.cmdBindIndexBuffer(
+        cmd_buf,
+        app.vertex_buffer,
+        vertex_buffer_size,
+        .uint16,
+    );
+
+    app.device.cmdPushConstants(
+        cmd_buf,
+        app.pipeline_layout,
+        .{ .vertex_bit = true },
+        0,
+        @sizeOf(vk.DeviceAddress),
+        @ptrCast(&app.shader_data_buffers[app.frame_index].device_address),
+    );
+
+    app.device.cmdDrawIndexed(cmd_buf, @intCast(app.indices.len), 3, 0, 0, 0);
+    app.device.cmdEndRendering(cmd_buf);
+
+    app.device.cmdPipelineBarrier2(cmd_buf, &vk.DependencyInfo{
+        .image_memory_barrier_count = 1,
+        .p_image_memory_barriers = @ptrCast(&std.mem.zeroInit(
+            vk.ImageMemoryBarrier2,
+            .{
+                .src_stage_mask = .{ .color_attachment_output_bit = true },
+                .src_access_mask = .{ .color_attachment_write_bit = true },
+                .dst_stage_mask = .{ .color_attachment_output_bit = true },
+                .dst_access_mask = .{},
+                .old_layout = .attachment_optimal,
+                .new_layout = .present_src_khr,
+                .image = app.swapchain_images[app.image_index],
+                .subresource_range = .{
+                    .aspect_mask = .{ .color_bit = true },
+                    .level_count = 1,
+                    .layer_count = 1,
+                    .base_array_layer = 0,
+                    .base_mip_level = 0,
+                },
+            },
+        )),
+    });
+
+    try app.device.endCommandBuffer(cmd_buf);
+
+    // submit to graphics queue
+    try app.device.queueSubmit(
+        app.queue,
+        (&vk.SubmitInfo{
+            .wait_semaphore_count = 1,
+            .p_wait_semaphores = @ptrCast(&app.present_semaphores[app.frame_index]),
+            .p_wait_dst_stage_mask = @ptrCast(&vk.PipelineStageFlags{
+                .color_attachment_output_bit = true,
+            }),
+            .command_buffer_count = 1,
+            .p_command_buffers = @ptrCast(&cmd_buf),
+            .signal_semaphore_count = 1,
+            .p_signal_semaphores = @ptrCast(&app.render_semaphores[app.image_index]),
+        })[0..1],
+        app.fences[app.frame_index],
+    );
+
+    app.frame_index = (app.frame_index + 1) % max_frames_in_flight;
+
+    try chk_swapchain(try app.device.queuePresentKHR(
+        app.queue,
+        &vk.PresentInfoKHR{
+            .wait_semaphore_count = 1,
+            .p_wait_semaphores = @ptrCast(&app.render_semaphores[app.image_index]),
+            .swapchain_count = 1,
+            .p_swapchains = @ptrCast(&app.swapchain),
+            .p_image_indices = @ptrCast(&app.image_index),
+        },
+    ));
+
+    // TMP
+    while (app.window.getEvent()) |event| {
+        switch (event) {
+            .close => return false,
+            else => {},
+        }
+    }
+    // TMP
+    return true;
 }
 
 fn renderSplash(fb: *wio.Framebuffer, size: wio.Size, t: u16) void {
@@ -165,7 +459,11 @@ fn renderSplash(fb: *wio.Framebuffer, size: wio.Size, t: u16) void {
         var x: u32 = 0;
         while (x < size.width) : (x += 1) {
             const v = x ^ y ^ t;
-            fb.setPixel(x, y, ((v & 0xFF) << 16) | (((v >> 1) & 0xFF) << 8) | ((v >> 2) & 0xFF));
+            fb.setPixel(
+                x,
+                y,
+                ((v & 0xFF) << 16) | (((v >> 1) & 0xFF) << 8) | ((v >> 2) & 0xFF),
+            );
         }
     }
 }
@@ -412,7 +710,8 @@ fn createSwapchain() !void {
         app.surface_capabilities.max_image_extent.height,
     ));
 
-    const image_format: vk.Format = .b8g8r8a8_srgb;
+    app.image_format = .b8g8r8a8_srgb;
+    const image_format = app.image_format;
     app.swapchain = try app.device.createSwapchainKHR(&vk.SwapchainCreateInfoKHR{
         .surface = app.surface,
         .min_image_count = app.surface_capabilities.min_image_count,
@@ -458,6 +757,10 @@ fn createSwapchain() !void {
     log.info("allocated {d} swapchain image views", .{app.swapchain_image_views.len});
 }
 
+fn recreateSwapchain() !void {
+    try app.device.deviceWaitIdle();
+}
+
 fn createDepthAttachment() !void {
     log.debug("creating depth attachment (start)", .{});
 
@@ -477,6 +780,7 @@ fn createDepthAttachment() !void {
     }
     assert(depth_format != .undefined);
 
+    app.depth_format = depth_format;
     log.debug("depth format selected: {any}", .{depth_format});
 
     try chk_c(c.vmaCreateImage(
@@ -965,6 +1269,173 @@ fn loadTextures() !void {
     }, null);
 }
 
+fn loadShaders() !void {
+    app.slang_wrapper = c.slang_wrapper_create().?;
+    const spirv_buffer: *c.SpirvBuffer = c.slang_shader_compile(
+        app.slang_wrapper,
+        "triangle",
+        "src/assets/shader.slang",
+        // "assets/shader.slang",
+    );
+    defer c.slang_shader_free(spirv_buffer);
+    const shader_module = try app.device.createShaderModule(
+        &vk.ShaderModuleCreateInfo{
+            .code_size = spirv_buffer.code_size,
+            .p_code = spirv_buffer.code_ptr,
+        },
+        null,
+    );
+
+    app.pipeline = try createPipeline(shader_module);
+}
+
+fn createPipeline(shader_module: vk.ShaderModule) !vk.Pipeline {
+    log.info("creating pipeline for shader module: {any}", .{shader_module});
+    app.pipeline_layout = try app.device.createPipelineLayout(
+        &vk.PipelineLayoutCreateInfo{
+            .set_layout_count = 1,
+            .p_set_layouts = @ptrCast(&app.descriptor_set_layout_tex),
+            .push_constant_range_count = 1,
+            .p_push_constant_ranges = @ptrCast(&vk.PushConstantRange{
+                .stage_flags = .{ .vertex_bit = true },
+                .size = @sizeOf(vk.DeviceAddress),
+                .offset = 0,
+            }),
+        },
+        null,
+    );
+
+    var pipeline: vk.Pipeline = .null_handle;
+    var pipelines: []vk.Pipeline = undefined;
+    pipelines.ptr = @ptrCast(&pipeline);
+    pipelines.len = 1;
+
+    var pipeline_create_info = vk.GraphicsPipelineCreateInfo{
+        .p_next = @ptrCast(&vk.PipelineRenderingCreateInfo{
+            .color_attachment_count = 1,
+            .p_color_attachment_formats = @ptrCast(&app.image_format),
+            .depth_attachment_format = app.depth_format,
+            .stencil_attachment_format = .undefined,
+            .view_mask = 0,
+        }),
+        .stage_count = 2,
+        .p_stages = &[_]vk.PipelineShaderStageCreateInfo{
+            vk.PipelineShaderStageCreateInfo{
+                .stage = .{ .vertex_bit = true },
+                .module = shader_module,
+                .p_name = "main",
+            },
+            vk.PipelineShaderStageCreateInfo{
+                .stage = .{ .fragment_bit = true },
+                .module = shader_module,
+                .p_name = "main",
+            },
+        },
+        .p_vertex_input_state = &vk.PipelineVertexInputStateCreateInfo{
+            .vertex_binding_description_count = 1,
+            .p_vertex_binding_descriptions = @ptrCast(&vk.VertexInputBindingDescription{
+                .binding = 0,
+                .stride = @sizeOf(Vertex),
+                .input_rate = .vertex,
+            }),
+            .vertex_attribute_description_count = 3,
+            .p_vertex_attribute_descriptions = @ptrCast(&[_]vk.VertexInputAttributeDescription{
+                vk.VertexInputAttributeDescription{
+                    .location = 0,
+                    .binding = 0,
+                    .offset = @offsetOf(Vertex, "pos"),
+                    .format = .r32g32b32_sfloat,
+                },
+                vk.VertexInputAttributeDescription{
+                    .binding = 0,
+                    .location = 1,
+                    .offset = @offsetOf(Vertex, "normal"),
+                    .format = .r32g32b32_sfloat,
+                },
+                vk.VertexInputAttributeDescription{
+                    .binding = 0,
+                    .location = 2,
+                    .offset = @offsetOf(Vertex, "uv"),
+                    .format = .r32g32_sfloat,
+                },
+            }),
+        },
+        .p_input_assembly_state = &vk.PipelineInputAssemblyStateCreateInfo{
+            .topology = .triangle_list,
+            .primitive_restart_enable = .false,
+        },
+        .p_viewport_state = &vk.PipelineViewportStateCreateInfo{
+            .viewport_count = 1,
+            .scissor_count = 1,
+        },
+        .p_rasterization_state = &std.mem.zeroInit(
+            vk.PipelineRasterizationStateCreateInfo,
+            .{
+                .line_width = 1,
+            },
+        ),
+        .p_multisample_state = &vk.PipelineMultisampleStateCreateInfo{
+            .rasterization_samples = .{ .@"1_bit" = true },
+            .sample_shading_enable = .false,
+            .min_sample_shading = 0,
+            .alpha_to_coverage_enable = .false,
+            .alpha_to_one_enable = .false,
+        },
+        .p_depth_stencil_state = &std.mem.zeroInit(
+            vk.PipelineDepthStencilStateCreateInfo,
+            .{
+                .depth_test_enable = .true,
+                .depth_write_enable = .true,
+                .depth_compare_op = .less_or_equal,
+            },
+        ),
+        .p_color_blend_state = &vk.PipelineColorBlendStateCreateInfo{
+            .attachment_count = 1,
+            .p_attachments = @ptrCast(
+                &std.mem.zeroInit(
+                    vk.PipelineColorBlendAttachmentState,
+                    .{
+                        .color_write_mask = .{
+                            .r_bit = true,
+                            .g_bit = true,
+                            .b_bit = true,
+                            .a_bit = true,
+                        },
+                    },
+                ),
+            ),
+            .logic_op = .clear,
+            .logic_op_enable = .false,
+            .blend_constants = [4]f32{ 0, 0, 0, 0 },
+        }, // TODO:
+        .p_dynamic_state = &vk.PipelineDynamicStateCreateInfo{
+            .dynamic_state_count = 2,
+            .p_dynamic_states = @ptrCast(&[2]vk.DynamicState{
+                .viewport,
+                .scissor,
+            }),
+        }, // TODO:
+        .layout = app.pipeline_layout,
+
+        .base_pipeline_index = 0,
+        .subpass = 0,
+    };
+
+    var pipeline_create_infos: []vk.GraphicsPipelineCreateInfo = undefined;
+    pipeline_create_infos.ptr = @ptrCast(&pipeline_create_info);
+    pipeline_create_infos.len = 1;
+
+    try chk(try app.device.createGraphicsPipelines(
+        .null_handle,
+        pipeline_create_infos,
+        null,
+        pipelines,
+    ));
+
+    assert(pipeline != .null_handle);
+    return pipeline;
+}
+
 fn chk(result: vk.Result) !void {
     if (result != .success) {
         log.err("encountered vulkan error result: {any}", .{result});
@@ -974,4 +1445,12 @@ fn chk(result: vk.Result) !void {
 
 fn chk_c(result: c.VkResult) !void {
     try chk(@enumFromInt(result));
+}
+
+fn chk_swapchain(result: vk.Result) !void {
+    if (result == .error_out_of_date_khr) {
+        app.update_swapchain = true;
+        return;
+    }
+    return chk(result);
 }
